@@ -347,11 +347,14 @@ misses a prefix, the NotFound fallback catches it.
 #    is signed or published — if either WASM's predecessor hash is missing.
 cargo make publish-delta
 
-# 5. Commit everything
+# 5. Commit everything, including the bumped version counter
 git add legacy_delegates.toml legacy_contracts.toml pointer-records.toml \
-    ui/public/contracts/ common/ contracts/
+    ui/public/contracts/ common/ contracts/ published-contract/contract-version.txt
 git commit -m "fix: description with delegate migration"
 git push
+# Remember to commit published-contract/contract-version.txt. It is NOT
+# updated by the migration workflow; `cargo make sign-webapp` (run
+# transitively by publish-delta) increments it on each publish.
 
 # 6. AFTER the PR merges, from main: publish the re-signed pointer records.
 #    Signing is offline and belongs in the PR; the network write does not.
@@ -469,6 +472,13 @@ cargo make bundle-webapp     # -> target/webapp/webapp.tar.xz, gated, no publish
 ```
 
 Do not sign or publish an archive produced any other way.
+
+**Version counter**: `published-contract/contract-version.txt` is the source of
+truth for the web-container version. `cargo make sign-webapp` (run transitively
+by `publish-delta`) reads, bumps, and writes it back each publish. Do not
+derive the version from wall-clock time — see delta#71 for the failure mode.
+Commit the bumped counter file alongside the other publish artifacts, and send
+a pull request for all changes before pushing.
 
 Contract ID: `EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr`
 
