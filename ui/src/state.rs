@@ -519,17 +519,27 @@ pub fn select_page(page_id: PageId) {
     }
 }
 
-/// Create a new page. For owned sites with a contract key, sends to delegate
-/// for signing. For example data, creates with placeholder signature.
+/// Create a new page and open it in the editor.
 pub fn create_page(title: String) {
-    let Some(prefix) = (*CURRENT_SITE.read()).clone() else {
-        return;
-    };
+    if let Some(id) = add_page(title) {
+        *CURRENT_PAGE.write() = Some(id);
+        *EDITING.write() = true;
+    }
+}
+
+/// Add a new page to the current site without navigating to it, returning
+/// its id, or `None` if no page was added (no current site, or the user does
+/// not own it), in which case nothing at all changed. For owned sites with a
+/// contract key, sends to delegate for signing. For example data, creates
+/// with placeholder signature.
+///
+/// Leaves `CURRENT_PAGE` and `EDITING` alone so a caller that is mid-edit on
+/// another page (the editor's "+ Create" autocomplete) keeps its draft open.
+pub fn add_page(title: String) -> Option<PageId> {
+    let prefix = (*CURRENT_SITE.read()).clone()?;
 
     let sites = SITES.read();
-    let Some(site) = sites.get(&prefix) else {
-        return;
-    };
+    let site = sites.get(&prefix)?;
 
     // Allocate an id strictly greater than every id ever used on this site —
     // live pages AND tombstoned (deleted) pages — not just `next_page_id`.
@@ -592,10 +602,10 @@ pub fn create_page(title: String) {
                 site.state.next_page_id = id + 1;
             }
         }
+        Some(id)
+    } else {
+        None
     }
-
-    *CURRENT_PAGE.write() = Some(id);
-    *EDITING.write() = true;
 }
 
 /// Save the current page edit. Routes through delegate for signing if connected.
@@ -762,7 +772,7 @@ pub fn swap_page_order(page_a: PageId, page_b: PageId) {
     // local state never advertises the new orders alongside the
     // previous timestamps. The signature on disk is still the old one
     // until the delegate echoes back a fresh signed page; that is the
-    // pre-existing optimistic-update pattern (see also `create_page`,
+    // pre-existing optimistic-update pattern (see also `add_page`,
     // which inserts pages with a zeroed signature placeholder).
     SITES.with_mut(|sites| {
         if let Some(site) = sites.get_mut(&prefix) {
@@ -1093,7 +1103,7 @@ mod tests {
         // set without advancing `next_page_id`, leaving `next_page_id`
         // pointing at/below a TOMBSTONED id. Allocating that id makes
         // `handle_signed_page` drop the new page (`deleted_pages` guard),
-        // silently losing it. `create_page` must allocate above every id ever
+        // silently losing it. `add_page` must allocate above every id ever
         // used — live OR tombstoned.
         let owner = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
         let mut state = delta_core::SiteState::new(delta_core::SiteConfig::default(), &owner);

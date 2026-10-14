@@ -187,50 +187,16 @@ pub fn Editor() -> Element {
     let match_count = matches.len() + if show_create { 1 } else { 0 };
 
     // Insert a page link (or create a new page)
-    let mut insert_link = move |id: PageId, title: &str| {
-        let content = state::EDITOR_CONTENT.read().clone();
-        // `cursor_pos` is a UTF-8 byte offset stored by
-        // `update_autocomplete`. Clamp to a valid char boundary in
-        // case the content was edited between the input event and
-        // this callback firing; slicing inside a multi-byte char
-        // would panic with "unreachable" in WASM.
-        let mut pos = (*cursor_pos.read()).min(content.len());
-        while pos > 0 && !content.is_char_boundary(pos) {
-            pos -= 1;
-        }
-        let before = &content[..pos];
-
-        if id == u64::MAX {
-            // Create a new page with this title, then insert link
-            let new_title = title.to_string();
-            state::create_page(new_title);
-            // The new page ID is the one just created
-            if let Some(site) = state::current_site() {
-                let new_id = site.state.next_page_id - 1;
-                if let Some(open) = before.rfind("[[") {
-                    let after_cursor = &content[pos..];
-                    let mut new_content = content[..open].to_string();
-                    new_content.push_str(&format!("[[{new_id}]]"));
-                    new_content.push_str(after_cursor);
-                    *state::EDITOR_CONTENT.write() = new_content;
-                }
-            }
-            // Switch back to the page we were editing
-            // (create_page switches to the new page and opens editor)
-            *state::EDITING.write() = false;
-        } else if let Some(open) = before.rfind("[[") {
-            let after_cursor = &content[pos..];
-            let mut new_content = content[..open].to_string();
-            new_content.push_str(&format!("[[{id}]]"));
-            new_content.push_str(after_cursor);
-            *state::EDITOR_CONTENT.write() = new_content;
-        }
+    let mut insert_link = move |target: LinkTarget| {
+        insert_link_target(target, *cursor_pos.read());
         ac_visible.set(false);
         ac_query.set(None);
         ac_selected.set(0);
     };
 
     let _ = (ac_top, ac_left, ac_open_upward); // no longer used for positioning
+    let key_matches = matches.clone();
+    let key_create = show_create.then(|| ac_query_val.clone());
 
     rsx! {
         div { class: "flex flex-col h-full bg-panel",
@@ -309,29 +275,11 @@ pub fn Editor() -> Element {
                                     }
                                     Key::Tab | Key::Enter => {
                                         evt.prevent_default();
-                                        let matches: Vec<(PageId, String)> = if let Some(query) = &*ac_query.read() {
-                                            let lower = query.to_lowercase();
-                                            state::current_site()
-                                                .map(|site| {
-                                                    site.state.pages.iter()
-                                                        .filter(|(_, p)| lower.is_empty() || p.title.to_lowercase().contains(&lower))
-                                                        .map(|(&id, p)| (id, p.title.clone()))
-                                                        .collect()
-                                                })
-                                                .unwrap_or_default()
-                                        } else {
-                                            Vec::new()
-                                        };
-                                        if sel < matches.len() {
-                                            if let Some((id, title)) = matches.get(sel) {
-                                                insert_link(*id, title);
-                                            }
-                                        } else {
-                                            // "Create" option selected
-                                            let q = ac_query.read().clone().unwrap_or_default();
-                                            if !q.is_empty() {
-                                                insert_link(u64::MAX, &q);
-                                            }
+                                        // Index into the same list the dropdown renders
+                                        // (which excludes the current page), so the
+                                        // highlighted row is the one inserted.
+                                        if let Some(target) = selected_link_target(&key_matches, sel, key_create.as_deref()) {
+                                            insert_link(target);
                                         }
                                     }
                                     Key::Escape => {
@@ -356,7 +304,6 @@ pub fn Editor() -> Element {
                                     {
                                         let id = *id;
                                         let page_title_display = page_title.clone();
-                                        let page_title_insert = page_title.clone();
                                         let is_highlighted = idx == *ac_selected.read();
                                         let item_class = if is_highlighted {
                                             "w-full text-left px-3 py-1.5 text-sm bg-accent-soft text-accent"
@@ -368,7 +315,7 @@ pub fn Editor() -> Element {
                                                 class: "{item_class}",
                                                 onmousedown: move |evt| {
                                                     evt.prevent_default();
-                                                    insert_link(id, &page_title_insert);
+                                                    insert_link(LinkTarget::Existing(id));
                                                 },
                                                 "{page_title_display}"
                                             }
@@ -390,7 +337,7 @@ pub fn Editor() -> Element {
                                                 class: "{item_class}",
                                                 onmousedown: move |evt| {
                                                     evt.prevent_default();
-                                                    insert_link(u64::MAX, &create_title);
+                                                    insert_link(LinkTarget::New(create_title.clone()));
                                                 },
                                                 "+ Create \"{ac_query_val}\""
                                             }
@@ -494,6 +441,87 @@ fn update_autocomplete(
     }
     ac_visible.set(false);
     ac_query.set(None);
+}
+
+/// What an autocomplete pick links to.
+#[derive(Debug, PartialEq)]
+enum LinkTarget {
+    /// An existing page.
+    Existing(PageId),
+    /// The "+ Create" row: a new page with this title.
+    New(String),
+}
+
+/// The target of autocomplete row `sel`, given the rows the dropdown
+/// renders: the page rows `matches`, then a "+ Create" row titled `create`
+/// when it is shown. Any other `sel` (e.g. a stale index) selects nothing.
+fn selected_link_target(
+    matches: &[(PageId, String)],
+    sel: usize,
+    create: Option<&str>,
+) -> Option<LinkTarget> {
+    match matches.get(sel) {
+        Some((id, _)) => Some(LinkTarget::Existing(*id)),
+        None if sel == matches.len() => create.map(|t| LinkTarget::New(t.to_string())),
+        None => None,
+    }
+}
+
+/// The byte range of the open `[[query` that ends at the cursor `pos` in
+/// `content`, or `None` if the cursor is not inside one.
+fn open_link_query(content: &str, pos: usize) -> Option<(usize, usize)> {
+    // `pos` is a UTF-8 byte offset stored by `update_autocomplete`. Clamp to
+    // a valid char boundary in case the content was edited between the input
+    // event and this callback firing; slicing inside a multi-byte char would
+    // panic with "unreachable" in WASM.
+    let mut pos = pos.min(content.len());
+    while pos > 0 && !content.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    let open = content[..pos].rfind("[[")?;
+    // Same rule `update_autocomplete` uses to open the dropdown, so a stale
+    // cursor cannot overwrite a finished link or span lines.
+    let between = &content[open + 2..pos];
+    if between.contains("]]") || between.contains('\n') {
+        return None;
+    }
+    Some((open, pos))
+}
+
+/// Replace the open `[[query` that ends at byte offset `pos` in `content`
+/// with a `[[id]]` link, keeping everything after the cursor.
+fn splice_link(content: &str, pos: usize, id: PageId) -> Option<String> {
+    let (open, pos) = open_link_query(content, pos)?;
+    Some(format!("{}[[{id}]]{}", &content[..open], &content[pos..]))
+}
+
+/// Apply an autocomplete pick to the draft at cursor `pos`.
+///
+/// For "+ Create" this uses `state::add_page`, not `create_page`: the latter
+/// navigates to the new page, which left `CURRENT_PAGE` on the new empty page
+/// and threw away the draft being edited along with the link just inserted
+/// (freenet/delta#68). Here `CURRENT_PAGE` and `EDITING` never change, so the
+/// editor stays on the page being written, and the seeding effect leaves the
+/// edited buffer alone because it no longer matches what was seeded.
+fn insert_link_target(target: LinkTarget, pos: usize) {
+    let content = state::EDITOR_CONTENT.read().clone();
+    // Check before creating anything, so a stale cursor cannot leave an
+    // orphan page with no link to it.
+    if open_link_query(&content, pos).is_none() {
+        return;
+    }
+    let id = match target {
+        LinkTarget::Existing(id) => id,
+        LinkTarget::New(title) => {
+            let Some(id) = state::add_page(title) else {
+                return;
+            };
+            id
+        }
+    };
+    if let Some(new_content) = splice_link(&content, pos, id) {
+        *state::EDITOR_CONTENT.write() = new_content;
+    }
 }
 
 /// Behavioural coverage for the edit-buffer seeding effect (freenet/delta#62).
@@ -817,11 +845,206 @@ mod reseed_tests {
             );
         });
     }
+
+    #[test]
+    fn creating_a_page_from_autocomplete_keeps_the_draft_and_the_link() {
+        // freenet/delta#68: "+ Create" used to call `state::create_page`,
+        // which moved CURRENT_PAGE to the new empty page. The editor then
+        // closed (or re-seeded) on the wrong page and the draft, including the
+        // link being inserted, was gone.
+        let mut dom = open_editor_on(
+            site(&[(1, "Home", "persisted text"), (2, "Second", "second text")]),
+            1,
+        );
+
+        let draft = "intro [[New";
+        dom.in_runtime(|| {
+            *state::EDITOR_CONTENT.write() = format!("{draft} and the rest");
+        });
+        flush(&mut dom);
+
+        dom.in_runtime(|| insert_link_target(LinkTarget::New("New".into()), draft.len()));
+        flush(&mut dom);
+
+        dom.in_runtime(|| {
+            let new_id = state::SITES.read()[PREFIX]
+                .state
+                .pages
+                .iter()
+                .find(|(_, p)| p.title == "New")
+                .map(|(&id, _)| id)
+                .expect("the new page was added to the site");
+            assert!(new_id > 2);
+            assert_eq!(
+                *state::CURRENT_PAGE.read(),
+                Some(1),
+                "the editor must stay on the page being written"
+            );
+            assert!(*state::EDITING.read(), "the editor must stay open");
+            assert_eq!(
+                state::EDITOR_CONTENT.cloned(),
+                format!("intro [[{new_id}]] and the rest"),
+                "the draft and the inserted link must survive"
+            );
+            assert_eq!(state::EDITOR_TITLE.cloned(), "Home");
+        });
+
+        // For an owned site with a contract key, the delegate's signed copy
+        // of the new page lands later and replaces the optimistic one in
+        // SITES (`delegate::handle_signed_page`). That re-runs the seeding
+        // effect; the draft must still survive it.
+        let expected = dom.in_runtime(|| state::EDITOR_CONTENT.cloned());
+        dom.in_runtime(|| {
+            let mut sites = state::SITES.write();
+            let pages = &mut sites.get_mut(PREFIX).expect("site present").state.pages;
+            let new_id = *pages.keys().max().expect("pages present");
+            let owner = owner_key();
+            pages.insert(
+                new_id,
+                Page::new(new_id, "New".to_string(), String::new(), 101, &owner),
+            );
+        });
+        flush(&mut dom);
+        dom.in_runtime(|| {
+            assert_eq!(*state::CURRENT_PAGE.read(), Some(1));
+            assert_eq!(state::EDITOR_CONTENT.cloned(), expected);
+        });
+
+        // Positive control (see the sibling tests): prove the effect is still
+        // live, so "draft survived" cannot pass by the effect being dead.
+        dom.in_runtime(|| *state::CURRENT_PAGE.write() = Some(2));
+        flush(&mut dom);
+        dom.in_runtime(|| {
+            assert_eq!(
+                state::EDITOR_CONTENT.cloned(),
+                "second text",
+                "positive control: the seeding effect must still be live"
+            );
+        });
+    }
+
+    #[test]
+    fn creating_a_page_from_autocomplete_on_a_site_we_do_not_own_changes_nothing() {
+        // `add_page` adds nothing for a visitor, so there is no id to link.
+        // Guards against deriving one from `next_page_id` regardless.
+        let mut visitor_site = site(&[(1, "Home", "persisted text")]);
+        visitor_site.role = state::SiteRole::Visitor;
+        let mut dom = open_editor_on(visitor_site, 1);
+
+        dom.in_runtime(|| *state::EDITOR_CONTENT.write() = "intro [[New".to_string());
+        dom.in_runtime(|| insert_link_target(LinkTarget::New("New".into()), "intro [[New".len()));
+        flush(&mut dom);
+
+        dom.in_runtime(|| {
+            assert_eq!(state::SITES.read()[PREFIX].state.pages.len(), 1);
+            assert_eq!(*state::CURRENT_PAGE.read(), Some(1));
+            assert_eq!(state::EDITOR_CONTENT.cloned(), "intro [[New");
+        });
+    }
+
+    #[test]
+    fn create_from_autocomplete_without_an_open_link_adds_no_page() {
+        // A stale cursor with no `[[query` before it must not create an
+        // orphan page that nothing links to.
+        let mut dom = open_editor_on(site(&[(1, "Home", "persisted text")]), 1);
+
+        dom.in_runtime(|| *state::EDITOR_CONTENT.write() = "no brackets".to_string());
+        dom.in_runtime(|| insert_link_target(LinkTarget::New("New".into()), 5));
+        flush(&mut dom);
+
+        dom.in_runtime(|| {
+            assert_eq!(state::SITES.read()[PREFIX].state.pages.len(), 1);
+            assert_eq!(state::EDITOR_CONTENT.cloned(), "no brackets");
+            assert_eq!(*state::CURRENT_PAGE.read(), Some(1));
+        });
+    }
+
+    #[test]
+    fn create_page_still_opens_the_new_page_in_the_editor() {
+        // The sidebar's "+ New Page" relies on `create_page` navigating;
+        // splitting out `add_page` must not lose that.
+        let mut dom = open_editor_on(site(&[(1, "Home", "persisted text")]), 1);
+
+        dom.in_runtime(|| state::create_page("New Page".to_string()));
+        flush(&mut dom);
+
+        dom.in_runtime(|| {
+            assert_ne!(*state::CURRENT_PAGE.read(), Some(1));
+            assert!(*state::EDITING.read());
+            assert_eq!(state::EDITOR_TITLE.cloned(), "New Page");
+            assert_eq!(state::EDITOR_CONTENT.cloned(), "");
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::utf16_to_byte_index;
+    use super::{selected_link_target, splice_link, utf16_to_byte_index, LinkTarget};
+
+    #[test]
+    fn selected_link_target_follows_the_rendered_rows() {
+        // The rendered rows exclude the current page, so row 0 here is page
+        // 3 even if page 1 is the current page. The keyboard path used to
+        // index a list that still contained the current page, inserting a
+        // different link than the one highlighted.
+        let rows = vec![(3, "Third".to_string()), (5, "Fifth".to_string())];
+        assert_eq!(
+            selected_link_target(&rows, 0, Some("t")),
+            Some(LinkTarget::Existing(3))
+        );
+        assert_eq!(
+            selected_link_target(&rows, 1, Some("t")),
+            Some(LinkTarget::Existing(5))
+        );
+        // The row after the matches is "+ Create".
+        assert_eq!(
+            selected_link_target(&rows, 2, Some("Fresh")),
+            Some(LinkTarget::New("Fresh".to_string()))
+        );
+        // No Create row shown (the query exactly matches a page), and an
+        // index past every rendered row: neither may create a page.
+        assert_eq!(selected_link_target(&rows, 2, None), None);
+        assert_eq!(selected_link_target(&rows, 3, Some("Fresh")), None);
+    }
+
+    #[test]
+    fn splice_link_refuses_a_closed_link_or_a_line_break() {
+        // A stale cursor just after a finished link must not overwrite it.
+        let s = "intro [[7]] and more";
+        assert_eq!(splice_link(s, "intro [[7]]".len(), 9), None);
+        assert_eq!(splice_link("[[a\nb", 5, 9), None);
+    }
+
+    #[test]
+    fn splice_link_replaces_the_query_and_keeps_the_rest() {
+        let s = "intro [[New and the rest";
+        let pos = "intro [[New".len();
+        assert_eq!(
+            splice_link(s, pos, 7).as_deref(),
+            Some("intro [[7]] and the rest")
+        );
+    }
+
+    #[test]
+    fn splice_link_uses_the_last_open_bracket_before_the_cursor() {
+        let s = "[[1]] then [[Ne";
+        assert_eq!(
+            splice_link(s, s.len(), 2).as_deref(),
+            Some("[[1]] then [[2]]")
+        );
+    }
+
+    #[test]
+    fn splice_link_without_open_brackets_is_none() {
+        assert_eq!(splice_link("no link here", 5, 2), None);
+    }
+
+    #[test]
+    fn splice_link_clamps_a_stale_cursor() {
+        // Past the end, and inside the 2-byte "·": neither may panic.
+        assert_eq!(splice_link("[[a", 100, 3).as_deref(), Some("[[3]]"));
+        assert_eq!(splice_link("[[a·b", 4, 3).as_deref(), Some("[[3]]·b"));
+    }
 
     #[test]
     fn ascii_offsets_match_byte_offsets() {
